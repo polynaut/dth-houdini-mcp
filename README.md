@@ -57,3 +57,9 @@ nothing that saves or writes the `.hip`. Every command executed is appended to
 
 **The socket is unauthenticated.** That is acceptable while the surface is
 read-only; it must be fixed before any mutating tool ships — see PHASE0.md §7.
+
+## License
+
+[MIT](LICENSE) © Polynaut
+
+Not affiliated with SideFX or with the DazToHue toolset.
