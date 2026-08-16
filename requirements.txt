@@ -1,0 +1,3 @@
+# Host-side only. The listener uses Houdini's bundled Python and needs nothing.
+# Pinned to what Phase 0 was verified against (see PHASE0.md).
+mcp==2.0.0

@@ -1,0 +1,15 @@
+# Host-side virtualenv — recreate with requirements.txt
+.venv/
+
+# Audit logs are per-machine runtime output, not source. They record the
+# payloads executed inside Houdini, including local scene paths.
+logs/*.jsonl
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Houdini leftovers
+*.hip.bak
+backup/
+houdini_temp/
