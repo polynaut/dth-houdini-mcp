@@ -23,6 +23,32 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = int(os.environ.get("DTH_HOUDINI_MCP_PORT", "8911"))
 CONNECT_TIMEOUT = float(os.environ.get("DTH_HOUDINI_MCP_TIMEOUT", "15"))
 
+
+def token_path():
+    override = os.environ.get("DTH_HOUDINI_MCP_TOKEN_FILE")
+    if override:
+        return override
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "dth-houdini-mcp", "token")
+
+
+def read_token():
+    """Read the token the listener wrote at start().
+
+    Read per request, not cached at import: the listener issues a fresh token
+    every run, so restarting Houdini must not require restarting this server.
+    """
+    path = token_path()
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        raise ListenerError(
+            "no listener token at %s.\n"
+            "The listener writes it when start() runs inside Houdini -- "
+            "start it, or point DTH_HOUDINI_MCP_TOKEN_FILE at the right path." % path
+        )
+
 mcp = MCPServer(
     name="dth-houdini",
     version="0.0.1-phase0",
@@ -45,7 +71,12 @@ def call_listener(cmd, args=None, host=DEFAULT_HOST, port=DEFAULT_PORT, timeout=
     Phase 0 keeps connections short-lived rather than pooling: a Houdini that
     restarts mid-session must not leave a dead socket that looks alive.
     """
-    request = {"id": "%d" % time.time_ns(), "cmd": cmd, "args": args or {}}
+    request = {
+        "id": "%d" % time.time_ns(),
+        "cmd": cmd,
+        "args": args or {},
+        "token": read_token(),
+    }
     payload = (json.dumps(request) + "\n").encode("utf-8")
 
     try:

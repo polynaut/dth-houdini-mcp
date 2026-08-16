@@ -1,34 +1,67 @@
-"""Phase 0 check A: the socket transport, without any MCP involvement."""
+"""Phase 0 check A: the socket transport and its auth, without any MCP involvement.
+
+Exit code 0 = all checks passed.
+"""
 
 import json
-import socket
+import os
 import sys
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8911
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _common import PORT, call, read_token  # noqa: E402
+
+failures = []
 
 
-def call(cmd, args=None):
-    conn = socket.create_connection(("127.0.0.1", PORT), timeout=15)
-    try:
-        conn.sendall((json.dumps({"id": "t1", "cmd": cmd, "args": args or {}}) + "\n").encode())
-        buffer = b""
-        while b"\n" not in buffer:
-            chunk = conn.recv(65536)
-            if not chunk:
-                raise RuntimeError("closed early")
-            buffer += chunk
-    finally:
-        conn.close()
-    return json.loads(buffer.split(b"\n", 1)[0].decode())
+def expect(label, condition, detail=""):
+    print(("PASS  " if condition else "FAIL  ") + label + (" -- " + detail if detail else ""))
+    if not condition:
+        failures.append(label)
 
 
-print("--- ping ---")
-print(json.dumps(call("ping", {"message": "hello from the raw socket"}), indent=2))
+print("--- authenticated ping ---")
+ok = call("ping", {"message": "hello from the raw socket"}, port=PORT)
+print(json.dumps(ok, indent=2))
+expect("authenticated ping succeeds", ok.get("ok") is True)
+expect("payload echoes back", (ok.get("result") or {}).get("echo") == "hello from the raw socket")
 
-print("--- unknown command (must fail cleanly) ---")
-bad = call("definitely_not_a_command")
-print("ok:", bad["ok"], "|", bad["error"]["type"], "-", bad["error"]["message"])
+print()
+print("--- auth checks ---")
+missing = call("ping", include_token=False, port=PORT)
+expect(
+    "request with NO token is rejected",
+    missing.get("ok") is False and missing["error"]["type"] == "Unauthorized",
+    missing.get("error", {}).get("message", ""),
+)
 
-print("--- bad arg type (must fail cleanly) ---")
-bad2 = call("ping", {"message": 42})
-print("ok:", bad2["ok"], "|", bad2["error"]["type"], "-", bad2["error"]["message"])
+wrong = call("ping", token="not-the-real-token", port=PORT)
+expect(
+    "request with a WRONG token is rejected",
+    wrong.get("ok") is False and wrong["error"]["type"] == "Unauthorized",
+    wrong.get("error", {}).get("message", ""),
+)
+
+expect("token file is readable", bool(read_token()))
+
+print()
+print("--- input validation ---")
+unknown = call("definitely_not_a_command", port=PORT)
+expect(
+    "unknown command rejected cleanly",
+    unknown.get("ok") is False and unknown["error"]["type"] == "KeyError",
+    unknown.get("error", {}).get("message", ""),
+)
+
+bad_type = call("ping", {"message": 42}, port=PORT)
+expect(
+    "wrong arg type rejected cleanly",
+    bad_type.get("ok") is False and bad_type["error"]["type"] == "ValueError",
+    bad_type.get("error", {}).get("message", ""),
+)
+
+print()
+if failures:
+    print("FAILED: " + ", ".join(failures))
+    sys.exit(1)
+print("All checks passed.")

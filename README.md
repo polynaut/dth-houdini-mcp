@@ -55,8 +55,17 @@ Phase 0 is read-only: a fixed one-entry command table, loopback-only binding, an
 nothing that saves or writes the `.hip`. Every command executed is appended to
 `logs/listener-<pid>.jsonl` with its arguments, outcome and duration.
 
-**The socket is unauthenticated.** That is acceptable while the surface is
-read-only; it must be fixed before any mutating tool ships — see PHASE0.md §7.
+**Requests are authenticated.** `start()` writes a per-run token to
+`%LOCALAPPDATA%\dth-houdini-mcp\token`; every request must carry it, and it is
+checked before the command table is consulted. The token is regenerated each run
+and deleted on `stop()`.
+
+Loopback binding is *not* a security boundary — a line-oriented parser is
+reachable from HTTP-shaped traffic, which was measured against an earlier build
+of this listener and is now blocked two ways (token, plus dropping the
+connection on the first malformed line). Both are covered by
+`tests/test_crossprotocol.py`. The full account is in
+[PHASE0.md §7](PHASE0.md).
 
 ## License
 

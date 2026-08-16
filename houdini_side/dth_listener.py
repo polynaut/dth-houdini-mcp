@@ -24,6 +24,7 @@ Usage inside Houdini's Python Shell:
 import json
 import os
 import queue
+import secrets
 import socket
 import socketserver
 import sys
@@ -47,6 +48,64 @@ _server_thread = None
 _pump_installed = False
 _jobs = queue.Queue()
 _log_lock = threading.Lock()
+_token = None
+
+
+# --------------------------------------------------------------------------
+# Authentication
+#
+# The socket is loopback-only, which is NOT a security boundary: every process
+# on this machine can reach it, and a command dispatcher is reachable even from
+# HTTP-shaped traffic (measured -- see PHASE0.md). So every request carries a
+# token that only a process able to read the user's own files can know.
+# --------------------------------------------------------------------------
+
+def _token_path():
+    override = os.environ.get("DTH_HOUDINI_MCP_TOKEN_FILE")
+    if override:
+        return override
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "dth-houdini-mcp", "token")
+
+
+def _issue_token():
+    """Generate a fresh token per listener run and write it where the MCP server can read it.
+
+    Fresh per run on purpose: a stale token from a previous Houdini session
+    should never authenticate against this one.
+    """
+    global _token
+    _token = secrets.token_urlsafe(32)
+    path = _token_path()
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(_token)
+    try:
+        # Meaningful on POSIX. On Windows the containing %LOCALAPPDATA% is
+        # already user-scoped; this call does not tighten the ACL there.
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
+def _discard_token():
+    global _token
+    _token = None
+    try:
+        path = _token_path()
+        if os.path.isfile(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _token_ok(supplied):
+    if _token is None or not isinstance(supplied, str):
+        return False
+    return secrets.compare_digest(supplied, _token)
 
 
 # --------------------------------------------------------------------------
@@ -246,8 +305,49 @@ class _Handler(socketserver.StreamRequestHandler):
             request_id = None
             cmd = None
             args = {}
+
+            # A malformed line ENDS the conversation. Tolerating garbage and
+            # reading on is what makes cross-protocol injection work: an HTTP
+            # request line and headers each fail to parse, and the attacker's
+            # body line -- a perfectly valid command -- is reached on the next
+            # iteration. Measured against this listener before this guard
+            # existed; see PHASE0.md.
             try:
                 request = json.loads(raw.decode("utf-8"))
+            except Exception as exc:
+                self._respond(
+                    {
+                        "id": None,
+                        "ok": False,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": "malformed request line; closing connection",
+                        },
+                    }
+                )
+                self._audit_call(peer, None, {}, False, exc, started, note="closed-on-malformed-line")
+                return
+
+            if not isinstance(request, dict):
+                self._respond({
+                    "id": None,
+                    "ok": False,
+                    "error": {"type": "TypeError", "message": "request must be a JSON object; closing connection"},
+                })
+                self._audit_call(peer, None, {}, False, None, started, note="closed-on-non-object")
+                return
+
+            # Auth before anything else touches the command table.
+            if not _token_ok(request.get("token")):
+                self._respond({
+                    "id": request.get("id"),
+                    "ok": False,
+                    "error": {"type": "Unauthorized", "message": "missing or invalid token; closing connection"},
+                })
+                self._audit_call(peer, request.get("cmd"), {}, False, None, started, note="unauthorized")
+                return
+
+            try:
                 request_id = request.get("id")
                 cmd = request.get("cmd")
                 args = request.get("args") or {}
@@ -271,19 +371,25 @@ class _Handler(socketserver.StreamRequestHandler):
                     },
                 }
                 self._audit_call(peer, cmd, args, False, exc, started)
-            try:
-                self.wfile.write((json.dumps(response, default=repr) + "\n").encode("utf-8"))
-                self.wfile.flush()
-            except Exception:
-                return  # client hung up mid-response
+            if not self._respond(response):
+                return
 
-    def _audit_call(self, peer, cmd, args, ok, exc, started):
+    def _respond(self, response):
+        try:
+            self.wfile.write((json.dumps(response, default=repr) + "\n").encode("utf-8"))
+            self.wfile.flush()
+            return True
+        except Exception:
+            return False  # client hung up mid-response
+
+    def _audit_call(self, peer, cmd, args, ok, exc, started, note=None):
         _audit({
             "event": "command",
             "peer": peer,
             "cmd": cmd,
             "args": args,
             "ok": ok,
+            "note": note,
             "error": None if exc is None else "%s: %s" % (type(exc).__name__, exc),
             "duration_ms": round((time.time() - started) * 1000.0, 2),
         })
@@ -315,11 +421,13 @@ def start(port=None, host=DEFAULT_HOST):
         raise ValueError("refusing to bind to non-loopback host %r" % host)
 
     mechanism = _install_pump()
+    token_file = _issue_token()
 
     try:
         _server = _Server((host, port), _Handler)
     except OSError as exc:
         _remove_pump()
+        _discard_token()
         raise RuntimeError(
             "could not bind %s:%s (%s). Another listener may already be running; "
             "call stop() first, or pick another port." % (host, port, exc)
@@ -336,12 +444,15 @@ def start(port=None, host=DEFAULT_HOST):
         "houdini_version": hou.applicationVersionString(),
         "ui_available": _ui_available(),
         "commands": sorted(COMMANDS),
+        # The PATH only. The token itself is never written to the audit log.
+        "token_file": token_file,
     })
 
     print("[dth-listener] listening on %s:%s" % (host, port))
     print("[dth-listener] houdini      %s (ui_available=%s)" % (hou.applicationVersionString(), _ui_available()))
     print("[dth-listener] dispatch     %s" % mechanism)
     print("[dth-listener] commands     %s" % ", ".join(sorted(COMMANDS)))
+    print("[dth-listener] token file   %s" % token_file)
     print("[dth-listener] audit log    %s" % _log_path())
     if mechanism == "none-headless":
         print("[dth-listener] WARNING: no UI event loop; hou calls run INLINE on the socket thread.")
@@ -360,6 +471,7 @@ def stop():
     _server = None
     _server_thread = None
     _remove_pump()
+    _discard_token()
     _audit({"event": "stop", "port": port})
     print("[dth-listener] stopped (port %s)" % port)
 
@@ -371,6 +483,8 @@ def status():
         "pump_installed": _pump_installed,
         "ui_available": _ui_available(),
         "commands": sorted(COMMANDS),
+        "token_file": _token_path(),
+        "token_issued": _token is not None,
         "audit_log": _log_path(),
     }
 

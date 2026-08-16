@@ -1,30 +1,24 @@
 """Phase 0 check C: how long the main-thread hop actually costs, over 30 calls."""
 
-import json
-import socket
+import os
 import statistics
 import sys
 
-PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8911
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _common import PORT, call  # noqa: E402
 
 
-def call(cmd, args=None):
-    conn = socket.create_connection(("127.0.0.1", PORT), timeout=15)
-    try:
-        conn.sendall((json.dumps({"id": "l", "cmd": cmd, "args": args or {}}) + "\n").encode())
-        buffer = b""
-        while b"\n" not in buffer:
-            buffer += conn.recv(65536)
-    finally:
-        conn.close()
-    return json.loads(buffer.split(b"\n", 1)[0].decode())["result"]
+def ping(message="x"):
+    response = call("ping", {"message": message}, port=PORT)
+    if not response.get("ok"):
+        raise SystemExit("ping failed: %s" % response.get("error"))
+    return response["result"]
 
 
-waits = []
-for _ in range(30):
-    waits.append(call("ping", {"message": "x"})["main_thread_wait_ms"])
+waits = [ping()["main_thread_wait_ms"] for _ in range(30)]
 
-print("mechanism  ", call("ping")["dispatch_mechanism"])
+print("mechanism  ", ping()["dispatch_mechanism"])
 print("samples    ", len(waits))
 print("min ms     ", round(min(waits), 2))
 print("median ms  ", round(statistics.median(waits), 2))
